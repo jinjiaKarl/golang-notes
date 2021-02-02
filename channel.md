@@ -37,7 +37,7 @@ var i = <- ch
 close(ch)
 ```
 
-注意，已关闭的 channel，再次关闭会 panic
+注意，已关闭的 channel，再次关闭会 panic，不能往关闭的channel中发送数据，但是还是可以接收数据的，不会阻塞，接收的值都是对应的零值。
 
 ```go
 close(ch)
@@ -50,6 +50,13 @@ close(ch) // panic: close of closed channel
 func main() {
     ch := make(chan int, 100)
     for elem := range ch { // 主要就是这里的 for range...
+        fmt.Println(i)
+    }
+    //与上面的效果是一样的
+    for {
+        if v, ok := <-ch; !ok{
+            break
+        }
         fmt.Println(i)
     }
 }
@@ -75,7 +82,7 @@ func main() {
 ```go
 ch := make(chan int)
 close(ch)
-ch <- 1 // panic: send on closed channel
+ch <- 1 // panic: send on closed hannel
 ```
 
 注意，如果 close channel 时，有 sender goroutine 挂在 channel 的阻塞发送队列中，会导致 panic：

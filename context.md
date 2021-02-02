@@ -7,6 +7,16 @@
 - cancelCtx，用来取消程序的执行树，一般用 WithCancel，WithTimeout，WithDeadline 返回的取消函数本质上都是对应了 cancelCtx。
 - timerCtx，在 cancelCtx 上包了一层，支持基于时间的 cancel。
 
+
+```go
+type Context interface{
+     Deadline() (deadline time.Time, ok bool)
+     Done() <-chan struct{}  //当parent想让children退出时，返回的这个channel就会收到消息
+     Err() error
+     Value(key interface{}) interface{}
+}
+
+```
 # basic usage
 
 ## 使用 emptyCtx 初始化 context
@@ -164,6 +174,12 @@ func main() {
 valueCtx 主要就是用来携带贯穿整个逻辑流程的数据的，在分布式系统中最常见的就是 trace_id，在一些业务系统中，一些业务数据项也需要贯穿整个请求的生命周期，如 order_id，payment_id 等。
 
 WithValue 时即会生成 valueCtx：
+```go
+type valueCtx struct {
+     Context  //就是当前valueCtx的parent
+     key, val interface{}
+}
+```
 
 ```go
 func WithValue(parent Context, key, val interface{}) Context {
@@ -177,7 +193,7 @@ func WithValue(parent Context, key, val interface{}) Context {
 }
 ```
 
-key 必须为非空，且可比较。
+key 必须为非空，`且可比较`。
 
 在查找值，即执行 Value 操作时，会先判断当前节点的 k 是不是等于用户的输入 k，如果相等，返回结果，如果不等，会依次向上从子节点向父节点，一直查找到整个 ctx 的根。没有找到返回 nil。是一个递归流程：
 
@@ -190,7 +206,7 @@ func (c *valueCtx) Value(key interface{}) interface{} {
 }
 ```
 
-通过分析，ctx 这么设计是为了能让代码每执行到一个点都可以根据当前情况嵌入新的上下文信息，但我们也可以看到，如果我们每次加一个新值都执行 WithValue 会导致 ctx 的树的层数过高，查找成本比较高 O(H)。
+通过分析，ctx 这么设计是为了能让代码每执行到一个点都可以根据当前情况嵌入新的上下文信息，但我们也可以看到，**如果我们每次加一个新值都执行 WithValue 会导致 ctx 的树的层数过高，查找成本比较高 O(H)**。
 
 很多业务场景中，我们希望在请求入口存入值，在请求过程中随时取用。这时候我们可以将 value 作为一个 map 整体存入。
 
@@ -259,6 +275,19 @@ select {
 这里我们一边消费自己的 job channel，一边还需要监听 ctx.Done()，如果不监听 ctx.Done()，那显然也就不知道什么时候需要退出了。
 
 ### cancelCtx 分析
+```go
+// A canceler is a context type that can be canceled directly. The
+ // implementations are *cancelCtx and *timerCtx.
+
+type canceler interface {
+    // cancel closes c.done, cancels each of c's children, and, if
+ // removeFromParent is true, removes c from its parent's children.
+
+    cancel(removeFromParent bool, err error)
+    Done() <-chan struct{}
+}
+
+```
 
 ```go
 // A cancelCtx can be canceled. When canceled, it also cancels any children
@@ -295,6 +324,15 @@ func propagateCancel(parent Context, child canceler) {
 	if parent.Done() == nil {
 		return // 说明父节点一定是 emptyCtx，或者用户自己实现的 context.Context
 	}
+    // 父节点被cancel，自己也应该被cancel
+   select {
+   case <-parent.Done():
+       // parent is already canceled
+       child.cancel(false, parent.Err())
+       return
+   default:
+   }
+
 	if p, ok := parentCancelCtx(parent); ok {
 		p.mu.Lock()
 		if p.err != nil {
@@ -308,12 +346,12 @@ func propagateCancel(parent Context, child canceler) {
 		}
 		p.mu.Unlock()
 	} else { // 如果用户把 context 包在了自己的 struct 内就会到这个分支。
-		go func() {
-			select {
-			case <-parent.Done(): // 父节点取消，需要将这个取消指令同步给子节点
-				child.cancel(false, parent.Err())
-			case <-child.Done(): // 子节点取消的话，就不用等父节点了
-			}
+  		go func() {
+  			select {
+  			case <-parent.Done(): // 父节点取消，需要将这个取消指令同步给子节点
+  				child.cancel(false, parent.Err())
+  			case <-child.Done(): // 子节点取消的话，就不用等父节点了
+  			}
 		}()
 	}
 }
@@ -338,6 +376,37 @@ func parentCancelCtx(parent Context) (*cancelCtx, bool) {
 }
 ```
 
+```go
+// cancel closes c.done, cancels each of c's children, and, if
+ // removeFromParent is true, removes c from its parent's children.
+func (c *cancelCtx) cancel(removeFromParent bool, err error) {
+    if err == nil {
+        panic("context: internal error: missing cancel error")
+    }
+    c.mu.Lock()
+    if c.err != nil {
+        c.mu.Unlock()
+        return // already canceled
+    }
+    c.err = err // cancel发送，err字段被赋值
+    if c.done == nil {
+        c.done = closedchan
+    } else {
+        close(c.done)  //关闭当前context通道
+    }
+    // 关闭所有children的channel
+    for child := range c.children {
+        // NOTE: acquiring the child's lock while holding parent's lock.
+        child.cancel(false, err)
+    }
+    c.children = nil
+    c.mu.Unlock()
+
+    if removeFromParent {
+        removeChild(c.Context, c) //将自己从parent的children map中删除
+    }
+}
+```
 ## 使用 timerCtx 超时取消
 
 ### timerCtx 使用
@@ -381,7 +450,13 @@ type timerCtx struct {
 	cancelCtx
 	timer *time.Timer // Under cancelCtx.mu.
 
-	deadline time.Time
+	deadline time.Time //到期时间
+}
+
+//当 Timer 到期时，当时的时间会被发送给 C (channel)，除非 Timer 是被 AfterFunc 函数创建的。
+type Timer struct {
+    C <-chan Time     // The channel on which the time is delivered.
+    r runtimeTimer
 }
 ```
 
